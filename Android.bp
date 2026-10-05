@@ -1,0 +1,212 @@
+// JarvisOS: Soong build of llama.cpp as the second inference engine.
+//
+// Upstream builds with CMake. This file builds the same sources into one
+// shared library for system_server, CPU backend only, with the JNI bridge in
+// jarvisos/llama_jni.cpp. Unlike libcactus it also builds for x86_64, so a
+// model can run on the emulator.
+//
+// Left out on purpose: every GPU/NPU backend, and the parts of common/ that
+// download files, talk HTTP or start processes (arg, download, hf-cache,
+// preset, subproc, console). Nothing in the library opens a socket.
+//
+// Files CMake would generate are written by hand under jarvisos/; update them
+// when rebasing the fork.
+
+package {
+    default_applicable_licenses: ["vendor_llama_cpp_license"],
+}
+
+license {
+    name: "vendor_llama_cpp_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-MIT"],
+    license_text: ["LICENSE"],
+}
+
+cc_defaults {
+    name: "libllama_jarvis_defaults",
+
+    local_include_dirs: [
+        "include",
+        "ggml/include",
+        "ggml/src",
+        "ggml/src/ggml-cpu",
+        "jarvisos/include",
+    ],
+
+    cflags: [
+        "-O3",
+        "-DNDEBUG",
+        "-D_GNU_SOURCE",
+        "-DGGML_USE_CPU",
+        "-DGGML_USE_LLAMAFILE",
+        "-DGGML_SCHED_MAX_COPIES=4",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        // Third-party code: keep its warnings from failing the platform build.
+        "-Wno-error",
+        "-Wno-unused-parameter",
+        "-Wno-missing-field-initializers",
+    ],
+
+    compile_multilib: "64",
+    enabled: false,
+    arch: {
+        arm64: {
+            enabled: true,
+            // Same floor as libcactus (Snapdragon 8+ Gen 1 has all of these).
+            cflags: ["-march=armv8.2-a+fp16+dotprod+i8mm"],
+        },
+        x86_64: {
+            enabled: true,
+            // Above the Android x86_64 baseline: without AVX2 a model is too
+            // slow to test with. libllama_jarvis_cpucheck guards the load.
+            cflags: [
+                "-mavx2",
+                "-mfma",
+                "-mf16c",
+                "-mbmi2",
+            ],
+        },
+    },
+}
+
+// The C sources, as their own library: ggml.c / ggml.cpp and ggml-cpu.c /
+// ggml-cpu.cpp would otherwise compile to the same object file name.
+cc_library_static {
+    name: "libllama_jarvis_c",
+    defaults: ["libllama_jarvis_defaults"],
+    srcs: [
+        "ggml/src/ggml.c",
+        "ggml/src/ggml-alloc.c",
+        "ggml/src/ggml-quants.c",
+        "ggml/src/ggml-cpu/*.c",
+    ],
+    arch: {
+        arm64: {
+            srcs: ["ggml/src/ggml-cpu/arch/arm/quants.c"],
+        },
+        x86_64: {
+            srcs: ["ggml/src/ggml-cpu/arch/x86/quants.c"],
+        },
+    },
+}
+
+// ggml (C++ part) and llama itself. Separate from the library below because
+// src/ and common/ each have a unicode.h, and each must find its own.
+cc_library_static {
+    name: "libllama_jarvis_core",
+    defaults: ["libllama_jarvis_defaults"],
+
+    srcs: [
+        // ggml: tensors and the CPU backend
+        "ggml/src/ggml.cpp",
+        "ggml/src/ggml-backend.cpp",
+        "ggml/src/ggml-backend-dl.cpp",
+        "ggml/src/ggml-backend-meta.cpp",
+        "ggml/src/ggml-backend-reg.cpp",
+        "ggml/src/ggml-opt.cpp",
+        "ggml/src/ggml-threading.cpp",
+        "ggml/src/gguf.cpp",
+        "ggml/src/ggml-cpu/*.cpp",
+        "ggml/src/ggml-cpu/amx/*.cpp",
+        "ggml/src/ggml-cpu/tiled/*.cpp",
+        "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+
+        // llama
+        "src/*.cpp",
+        "src/models/*.cpp",
+    ],
+
+    local_include_dirs: ["src"],
+
+    cpp_std: "c++17",
+    cppflags: ["-fexceptions"],
+    // llama.cpp uses dynamic_cast. A cflag is not enough: Soong appends
+    // -fno-rtti after it unless this is set.
+    rtti: true,
+    stl: "libc++",
+
+    arch: {
+        arm64: {
+            srcs: ["ggml/src/ggml-cpu/arch/arm/repack.cpp"],
+        },
+        x86_64: {
+            srcs: ["ggml/src/ggml-cpu/arch/x86/repack.cpp"],
+        },
+    },
+}
+
+cc_library_shared {
+    name: "libllama_jarvis",
+    defaults: ["libllama_jarvis_defaults"],
+
+    srcs: [
+        // common: chat templates, tool-call parsing, sampling
+        "common/chat.cpp",
+        "common/chat-auto-parser-generator.cpp",
+        "common/chat-auto-parser-helpers.cpp",
+        "common/chat-diff-analyzer.cpp",
+        "common/chat-peg-parser.cpp",
+        "common/common.cpp",
+        "common/debug.cpp",
+        "common/json.cpp",
+        "common/json-schema.cpp",
+        "common/json-schema-to-grammar.cpp",
+        "common/log.cpp",
+        "common/peg-parser.cpp",
+        "common/reasoning-budget.cpp",
+        "common/sampling.cpp",
+        "common/trie.cpp",
+        "common/unicode.cpp",
+        "common/jinja/*.cpp",
+        "common/parsers/*.cpp",
+
+        // JarvisOS
+        "jarvisos/build-info.cpp",
+        "jarvisos/llama_jni.cpp",
+    ],
+
+    local_include_dirs: [
+        "common",
+        "vendor",
+    ],
+
+    whole_static_libs: [
+        "libllama_jarvis_c",
+        "libllama_jarvis_core",
+    ],
+
+    header_libs: ["jni_headers"],
+
+    shared_libs: [
+        "liblog",
+    ],
+
+    cpp_std: "c++17",
+    cppflags: ["-fexceptions"],
+    rtti: true,
+
+    ldflags: [
+        "-Wl,--gc-sections",
+        "-Wl,--exclude-libs,ALL",
+    ],
+
+    stl: "libc++",
+}
+
+// Built for the baseline CPU, loaded before libllama_jarvis to decide whether
+// that one is safe to load. See jarvisos/cpu_check.cpp.
+cc_library_shared {
+    name: "libllama_jarvis_cpucheck",
+    srcs: ["jarvisos/cpu_check.cpp"],
+    header_libs: ["jni_headers"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    stl: "none",
+    compile_multilib: "64",
+}
