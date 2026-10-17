@@ -25,6 +25,7 @@
 #include "common.h"
 #include "json.h"
 #include "llama.h"
+#include "sampling.h"
 
 #define TAG "LlamaJni"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -40,6 +41,11 @@ struct Engine {
     llama_context* ctx = nullptr;
     common_chat_templates_ptr templates;
     bool embedding = false;
+    // The prompt whose keys and values are in the context now. The next
+    // request reuses its longest shared beginning instead of computing it
+    // again: a session turn's system message and tools are the same every
+    // time, and a turn's second call repeats all of its first.
+    std::vector<llama_token> cached;
     // One call at a time per model: a llama_context is not thread-safe.
     std::mutex lock;
 };
@@ -139,15 +145,40 @@ std::string complete(Engine* engine, const std::string& messages_json,
 
     int max_tokens = 512;
     float temperature = 0.0f;
+    // Options for sessions (AGENT_EXPERIENCE.md 11.8), all off by default:
+    //   tool_choice          "auto" | "required" | "none"
+    //   parallel_tool_calls  let one reply make several calls (say + move)
+    //   constrain_tools      sample under the grammar llama.cpp builds from
+    //                        the tools' JSON schemas, so a call can only have
+    //                        arguments the schema allows (e.g. an enum of
+    //                        legal cells); lazy unless tool_choice is required
+    //   grammar              a GBNF grammar for the whole reply
+    //   calls_only           with constrain_tools and tool_choice "required":
+    //                        start the reply with the template's tool-call
+    //                        marker, so the model cannot write prose first
+    std::string tool_choice = "auto";
+    bool parallel_tool_calls = false;
+    bool constrain_tools = false;
+    bool calls_only = false;
+    std::string grammar;
     if (!options_json.empty()) {
         json options = json::parse(options_json);
         max_tokens = options.value("max_tokens", max_tokens);
         temperature = options.value("temperature", temperature);
+        tool_choice = options.value("tool_choice", tool_choice);
+        parallel_tool_calls = options.value("parallel_tool_calls", parallel_tool_calls);
+        constrain_tools = options.value("constrain_tools", constrain_tools);
+        grammar = options.value("grammar", grammar);
+        calls_only = options.value("calls_only", calls_only);
     }
 
     common_chat_templates_inputs inputs;
     inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(messages_json));
     inputs.tools = parse_tools(tools_json);
+    if (!inputs.tools.empty()) {
+        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice);
+        inputs.parallel_tool_calls = parallel_tool_calls;
+    }
     inputs.add_generation_prompt = true;
     inputs.use_jinja = true;
     // Answers, not visible reasoning: small models spend their whole budget
@@ -165,12 +196,86 @@ std::string complete(Engine* engine, const std::string& messages_json,
     }
     max_tokens = std::min(max_tokens, n_ctx - static_cast<int>(prompt.size()) - 1);
 
-    // Each request stands alone; the service keeps the conversation.
-    llama_memory_clear(llama_get_memory(engine->ctx), true);
+    // Each request stands alone (the service keeps the conversation), but
+    // the part of the prompt that matches the last one is already computed.
+    // Keep at least one token to decode: its logits start the reply.
+    llama_memory_t memory = llama_get_memory(engine->ctx);
+    size_t reused = 0;
+    while (reused < engine->cached.size() && reused + 1 < prompt.size()
+            && engine->cached[reused] == prompt[reused]) {
+        reused++;
+    }
+    if (reused == 0 || !llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(reused), -1)) {
+        llama_memory_clear(memory, true);
+        reused = 0;
+    }
+    engine->cached.clear();
 
     const auto start = std::chrono::steady_clock::now();
-    if (!decode_all(engine, prompt)) return error_envelope("llama_decode failed on the prompt");
+    std::vector<llama_token> fresh(prompt.begin() + reused, prompt.end());
+    if (!decode_all(engine, fresh)) return error_envelope("llama_decode failed on the prompt");
+    engine->cached = prompt;
     const double prefill_ms = ms_since(start);
+
+    // A grammar needs llama.cpp's own sampler, which also handles lazy
+    // grammars (free text until a tool call starts) and the template's
+    // trigger words. Without one, the plain chain below is used as before.
+    common_sampler* constrained = nullptr;
+    std::string forced;   // text the reply is made to start with
+    if (!grammar.empty() || (constrain_tools && !chat.grammar.empty())) {
+        common_params_sampling params;
+        params.temp = temperature;
+        if (!grammar.empty()) {
+            params.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
+        } else {
+            params.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, chat.grammar);
+            params.grammar_lazy = chat.grammar_lazy;
+            params.generation_prompt = chat.generation_prompt;
+            for (const std::string& word : chat.preserved_tokens) {
+                std::vector<llama_token> ids = common_tokenize(vocab, word, false, true);
+                if (ids.size() == 1) params.preserved_tokens.insert(ids[0]);
+            }
+            // As llama-server does: a trigger word that is one preserved
+            // token is matched as that token, anything else as text.
+            for (const common_grammar_trigger& trigger : chat.grammar_triggers) {
+                if (trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                    std::vector<llama_token> ids = common_tokenize(vocab, trigger.value, false, true);
+                    if (ids.size() == 1 && params.preserved_tokens.count(ids[0])) {
+                        common_grammar_trigger token_trigger;
+                        token_trigger.type = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+                        token_trigger.value = trigger.value;
+                        token_trigger.token = ids[0];
+                        params.grammar_triggers.push_back(token_trigger);
+                        continue;
+                    }
+                }
+                params.grammar_triggers.push_back(trigger);
+            }
+        }
+        constrained = common_sampler_init(engine->model, params);
+        if (constrained == nullptr) return error_envelope("could not set up the grammar");
+
+        // Even with tool_choice "required", llama.cpp's grammar for many
+        // templates lets prose come before the first call (Qwen3 wrote a
+        // line, and once 160 tokens of emoji, before or instead of calling).
+        // Begin the reply with the call marker itself, a trigger word of the
+        // template, and let the grammar take it from there.
+        if (calls_only && grammar.empty() && !params.grammar_lazy) {
+            // A required-call grammar carries no trigger words; the same
+            // request with tool_choice "auto" names the template's marker.
+            common_chat_templates_inputs lazy_inputs = inputs;
+            lazy_inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+            const common_chat_params lazy =
+                    common_chat_templates_apply(engine->templates.get(), lazy_inputs);
+            for (const common_grammar_trigger& trigger : lazy.grammar_triggers) {
+                if (trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD
+                        || trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) {
+                    forced = trigger.value;
+                    break;
+                }
+            }
+        }
+    }
 
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (temperature <= 0.0f) {
@@ -185,9 +290,25 @@ std::string complete(Engine* engine, const std::string& messages_json,
     std::string text;
     int generated = 0;
     bool failed = false;
+    if (!forced.empty()) {
+        std::vector<llama_token> marker = common_tokenize(vocab, forced, false, true);
+        for (llama_token token : marker) common_sampler_accept(constrained, token, true);
+        if (!decode_all(engine, marker)) {
+            common_sampler_free(constrained);
+            llama_sampler_free(sampler);
+            return error_envelope("llama_decode failed on the call marker");
+        }
+        text = forced;
+    }
     const auto decode_start = std::chrono::steady_clock::now();
     while (generated < max_tokens) {
-        llama_token token = llama_sampler_sample(sampler, engine->ctx, -1);
+        llama_token token;
+        if (constrained != nullptr) {
+            token = common_sampler_sample(constrained, engine->ctx, -1);
+            common_sampler_accept(constrained, token, true);
+        } else {
+            token = llama_sampler_sample(sampler, engine->ctx, -1);
+        }
         if (llama_vocab_is_eog(vocab, token)) break;
         text += common_token_to_piece(vocab, token, true);
         generated++;
@@ -210,6 +331,8 @@ std::string complete(Engine* engine, const std::string& messages_json,
     }
     const double decode_ms = ms_since(decode_start);
     llama_sampler_free(sampler);
+    const bool was_constrained = constrained != nullptr;
+    if (constrained != nullptr) common_sampler_free(constrained);
     if (failed) return error_envelope("llama_decode failed while generating");
 
     // Let llama.cpp's own parser for this model's template pull the tool
@@ -242,9 +365,12 @@ std::string complete(Engine* engine, const std::string& messages_json,
     out["response"] = message.content;
     out["function_calls"] = calls;
     out["raw"] = text;
+    out["constrained"] = was_constrained;
     out["time_to_first_token_ms"] = prefill_ms;
     out["total_time_ms"] = ms_since(start);
     out["prefill_tokens"] = prompt.size();
+    out["reused_tokens"] = reused;
+    out["forced"] = forced;
     out["decode_tokens"] = generated;
     out["prefill_tps"] = prefill_ms > 0 ? prompt.size() * 1000.0 / prefill_ms : 0.0;
     out["decode_tps"] = decode_ms > 0 ? generated * 1000.0 / decode_ms : 0.0;
